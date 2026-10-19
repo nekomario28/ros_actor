@@ -1,10 +1,9 @@
 from enum import Enum
-from dataclasses import dataclass
-from threading import Thread, Event, Semaphore, Lock
+from dataclasses import dataclass, field
+from threading import Thread, Event, Semaphore, Lock, RLock
 import time
 import yaml
 import inspect
-from dataclasses import dataclass
 from typing import Any
 
 import rclpy
@@ -373,9 +372,9 @@ class ActorBase:
             tran = ActorTransaction(self, tran_type, args, keys, callback,
                                     is_extern=is_extern)
 
-        def abort_stub():
+        def abort_stub(_tran=None):
             self.abort(tran)
-        def close_stub():
+        def close_stub(_tran=None):
             self.close(tran)
 
         tran.abort = abort_stub
@@ -401,16 +400,14 @@ class ActorBase:
     def multi_run(self, tran): raise Exception('illegal transaction type')
     
     def abort(self, tran):
-        with tran_lock:
-            if tran in active_tran:
-                active_tran.remove(tran)
-        tran.is_active = False
+        self.close(tran)
     
     def close(self, tran):
-        with tran_lock:
-            if tran in active_tran:
-                active_tran.remove(tran)
-        tran.is_active = False
+        with tran.lock:
+            with tran_lock:
+                if tran in active_tran:
+                    active_tran.remove(tran)
+            tran.is_active = False
                 
 # regular sync actor
 class SyncActor(ActorBase):    
@@ -444,22 +441,30 @@ class SyncActor(ActorBase):
     def sync_async_stub(self):
         def stub(tran):
             global num_task
-            ret = tran.actor.impl(*tran.args)
-            if tran.is_active:
+            try:
+                if not tran.is_active:
+                    return
+                ret = tran.actor.impl(*tran.args)
+                with tran.lock:
+                    if not tran.is_active:
+                        return
+                    self.close(tran)
                 tran.callback(ret)
+            finally:
                 self.close(tran)
                 num_task -= 1
         return stub
         
     def abort_async(self, tran):
-        global num_task
-        tran.callback(None)
-        self.close(tran)
-        num_task -= 1
+        with tran.lock:
+            if not tran.is_active:
+                return
+            self.close(tran)
+        tran.callback(False)
     
     def async_run(self, tran):
         global num_task, actor_executor
-        tran.abort = self.abort_async
+        tran.abort = lambda _tran=None: self.abort_async(tran)
         if num_task >= max_task: raise Exception('insufficient threads')
         task = actor_executor.create_task(self.sync_async_stub(), tran)
         tran.task = task
@@ -491,8 +496,11 @@ class AsyncActor(ActorBase):
     def async_run(self, tran):
         def stub(tran):
             def callback(*args, **keys):
+                with tran.lock:
+                    if not tran.is_active:
+                        return
+                    self.close(tran)
                 tran.callback(*args, **keys)
-                self.close(tran)
             return callback
         desc = self.impl(stub(tran), *tran.args, **tran.keys)
         if desc:
@@ -662,6 +670,8 @@ class ActorTransaction:
     start: float = 0.0
     is_extern: bool = False
     is_active: bool = True
+    # Claim terminal state under the lock; never call user code while holding it.
+    lock: Any = field(default_factory=RLock, repr=False, compare=False)
     
 # counter for statistics
 num_task = 0
@@ -684,7 +694,9 @@ w_tran = 0
 def actor_watchdog():
     global w_tran
     now = time.time()
-    for t in active_tran:
+    with tran_lock:
+        transactions = active_tran.copy()
+    for t in transactions:
         if not t.is_timed: continue
         elasp = now - t.start
         if elasp >= t.time:
