@@ -80,7 +80,7 @@ class AsyncLifecycleTest(unittest.TestCase):
         self.assertEqual(self.received, [])
         self.assert_closed(transaction)
 
-    def test_normal_none_result_is_not_a_cancellation(self):
+    def test_normal_none_result_is_preserved(self):
         for kind in ('async', 'sync'):
             with self.subTest(kind=kind):
                 self.received.clear()
@@ -101,6 +101,17 @@ class AsyncLifecycleTest(unittest.TestCase):
         self.assertEqual(self.received, ['done'])
         self.assert_closed(transaction)
 
+    def test_subscriber_async_completion_is_delivered_once(self):
+        node = SimpleNamespace(create_subscription=lambda *args: None)
+        env = SimpleNamespace(get_value=lambda name: node)
+        receiver = self.runtime.SubscriberActor(env, 'images', object, '/images', 10)
+        transaction = receiver.run(self.runtime.TransactionType.ASYNC, (), {},
+                                   callback=self.received.append)
+        receiver.callback('first')
+        receiver.callback('duplicate')
+        self.assertEqual(self.received, ['first'])
+        self.assert_closed(transaction)
+
     def test_async_callback_exception_still_closes_transaction(self):
         def fail(result):
             raise RuntimeError('consumer failed')
@@ -110,17 +121,17 @@ class AsyncLifecycleTest(unittest.TestCase):
             self.completion('done')
         self.assert_closed(transaction)
 
-    def test_sync_abort_is_callable_and_reports_failure_once(self):
+    def test_sync_abort_is_callable_and_preserves_none_notification_once(self):
         transaction = self.start_sync_actor()
         transaction.abort()
         transaction.abort()
-        self.assertEqual(self.received, [False])
+        self.assertEqual(self.received, [None])
         self.assert_closed(transaction)
         # An aborted job still occupies its executor slot until it exits.
         self.assertEqual(self.runtime.num_task, 1)
         self.finish_task()
         self.assertEqual(self.runtime.num_task, 0)
-        self.assertEqual(self.received, [False])
+        self.assertEqual(self.received, [None])
 
     def test_aborted_queued_sync_job_does_not_run_implementation(self):
         calls = []
@@ -137,7 +148,7 @@ class AsyncLifecycleTest(unittest.TestCase):
 
         transaction = self.start_sync_actor(impl=impl)
         self.finish_task()
-        self.assertEqual(self.received, [False])
+        self.assertEqual(self.received, [None])
         self.assert_closed(transaction)
         self.assertEqual(self.runtime.num_task, 0)
 
@@ -219,7 +230,7 @@ class AsyncLifecycleTest(unittest.TestCase):
                     thread.join(timeout=.5)
                 self.assertFalse(any(t.is_alive() for t in threads), 'callback deadlock')
                 self.assertEqual(errors, [])
-                expected = False if kind == 'abort' else 'done'
+                expected = None if kind == 'abort' else 'done'
                 self.assertEqual(sorted(received), [(0, expected), (1, expected)])
                 if kind == 'abort':
                     for function, args in tasks:
@@ -253,7 +264,7 @@ class AsyncLifecycleTest(unittest.TestCase):
         with patch.object(self.runtime.time, 'time', return_value=transaction.start + 1):
             self.runtime.actor_watchdog()
         self.finish_task()
-        self.assertEqual(self.received, [False])
+        self.assertEqual(self.received, [None])
         self.assert_closed(transaction)
         self.assertEqual(self.runtime.num_task, 0)
 

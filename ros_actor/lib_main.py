@@ -1,6 +1,6 @@
 from enum import Enum
-from dataclasses import dataclass, field
-from threading import Thread, Event, Semaphore, Lock, RLock
+from dataclasses import dataclass
+from threading import Thread, Event, Semaphore, Lock
 import time
 import yaml
 import inspect
@@ -403,11 +403,14 @@ class ActorBase:
         self.close(tran)
     
     def close(self, tran):
-        with tran.lock:
-            with tran_lock:
-                if tran in active_tran:
-                    active_tran.remove(tran)
+        # Only the caller that closes an active transaction may notify completion.
+        with tran_lock:
+            if not tran.is_active:
+                return False
+            if tran in active_tran:
+                active_tran.remove(tran)
             tran.is_active = False
+            return True
                 
 # regular sync actor
 class SyncActor(ActorBase):    
@@ -445,22 +448,16 @@ class SyncActor(ActorBase):
                 if not tran.is_active:
                     return
                 ret = tran.actor.impl(*tran.args)
-                with tran.lock:
-                    if not tran.is_active:
-                        return
-                    self.close(tran)
-                tran.callback(ret)
+                if self.close(tran):
+                    tran.callback(ret)
             finally:
                 self.close(tran)
                 num_task -= 1
         return stub
         
     def abort_async(self, tran):
-        with tran.lock:
-            if not tran.is_active:
-                return
-            self.close(tran)
-        tran.callback(False)
+        if self.close(tran):
+            tran.callback(None)
     
     def async_run(self, tran):
         global num_task, actor_executor
@@ -496,11 +493,8 @@ class AsyncActor(ActorBase):
     def async_run(self, tran):
         def stub(tran):
             def callback(*args, **keys):
-                with tran.lock:
-                    if not tran.is_active:
-                        return
-                    self.close(tran)
-                tran.callback(*args, **keys)
+                if self.close(tran):
+                    tran.callback(*args, **keys)
             return callback
         desc = self.impl(stub(tran), *tran.args, **tran.keys)
         if desc:
@@ -615,7 +609,7 @@ class SubscriberActor(MultiActor):
         with self.callback_lock:
             if tran.callback in self.callbacks:
                 self.callbacks.remove(tran.callback)
-        super().close(tran)
+        return super().close(tran)
         
 # actor wrapping for publisher
 class PublisherActor(SyncActor):
@@ -670,8 +664,6 @@ class ActorTransaction:
     start: float = 0.0
     is_extern: bool = False
     is_active: bool = True
-    # Claim terminal state under the lock; never call user code while holding it.
-    lock: Any = field(default_factory=RLock, repr=False, compare=False)
     
 # counter for statistics
 num_task = 0
